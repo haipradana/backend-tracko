@@ -21,6 +21,7 @@ import supervision as sv
 from decord import VideoReader, cpu
 import matplotlib.pyplot as plt
 from io import BytesIO
+import random
 import subprocess
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions, ContentSettings
 import logging
@@ -393,12 +394,34 @@ async def analyze_video(
                     heatmap_filename = f"heatmaps/heatmap_{analysis_id}_{timestamp}.png"
                     download_links['heatmap_image'] = save_to_azure_blob(heatmap_bytes, heatmap_filename, "image/png")
 
-                # Generate and save shelf map image (only shelf boxes with labels)
+                # Generate and save shelf map images (top-3 frames)
                 try:
-                    shelf_map_bytes = generate_shelf_map_image(video_path, processing_data['shelf_boxes_per_frame'] if processing_data else {}, analysis_id)
-                    if shelf_map_bytes:
-                        shelfmap_filename = f"shelfmaps/shelfmap_{analysis_id}_{timestamp}.png"
-                        download_links['shelf_map_image'] = save_to_azure_blob(shelf_map_bytes, shelfmap_filename, "image/png")
+                    shelf_map_images: list[str] = []
+                    if processing_data:
+                        top_images = generate_shelf_map_images(
+                            video_path,
+                            processing_data.get('shelf_boxes_per_frame', {}),
+                            analysis_id,
+                            top_k=3,
+                        )
+                        for idx, (f_idx, img_bytes) in enumerate(top_images):
+                            shelfmap_filename = f"shelfmaps/shelfmap_{analysis_id}_{timestamp}_f{f_idx}_{idx+1}.png"
+                            url = save_to_azure_blob(img_bytes, shelfmap_filename, "image/png")
+                            shelf_map_images.append(url)
+                    # Fallback: still try single best frame if multi failed
+                    if not shelf_map_images:
+                        shelf_map_bytes = generate_shelf_map_image(
+                            video_path,
+                            processing_data['shelf_boxes_per_frame'] if processing_data else {},
+                            analysis_id,
+                        )
+                        if shelf_map_bytes:
+                            shelfmap_filename = f"shelfmaps/shelfmap_{analysis_id}_{timestamp}.png"
+                            url = save_to_azure_blob(shelf_map_bytes, shelfmap_filename, "image/png")
+                            shelf_map_images.append(url)
+                    if shelf_map_images:
+                        download_links['shelf_map_images'] = shelf_map_images
+                        download_links['shelf_map_image'] = shelf_map_images[0]
                 except Exception as _e:
                     logger.warning(f"Shelf map generation failed: {_e}")
                 
@@ -1245,6 +1268,102 @@ def generate_shelf_map_image(video_path: str, shelf_boxes_per_frame: dict, analy
         logger.error(f"Error generating shelf map image: {e}")
         return None
 
+def _generate_shelf_map_image_for_frame(video_path: str, frame_idx: int, shelf_boxes_per_frame: dict, analysis_id: str) -> bytes | None:
+    """Generate shelf map image for a specific frame index."""
+    try:
+        vr = VideoReader(video_path, ctx=cpu(0))
+        frame = vr[int(frame_idx)].asnumpy()
+        img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Deduplicate overlapping shelves by keeping the largest box per shelf id
+        raw = shelf_boxes_per_frame.get(frame_idx, [])
+        best_by_id: dict[str, tuple[int, int, int, int]] = {}
+        for sid, (x1, y1, x2, y2) in raw:
+            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            if sid not in best_by_id:
+                best_by_id[sid] = (x1, y1, x2, y2)
+            else:
+                bx1, by1, bx2, by2 = best_by_id[sid]
+                barea = max(0, bx2 - bx1) * max(0, by2 - by1)
+                if area > barea:
+                    best_by_id[sid] = (x1, y1, x2, y2)
+
+        # Draw shelves (single box per id) with big centered numeric label inside
+        for sid, (x1, y1, x2, y2) in best_by_id.items():
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 120, 255), 2)
+
+            # Prefer numeric id for large label (e.g., shelf_4 -> 4)
+            try:
+                num = str(int(str(sid).split('_')[-1]))
+                label_text = num
+            except Exception:
+                label_text = str(sid)
+
+            # Dynamic font scale based on box height
+            box_h = max(1, y2 - y1)
+            font_scale = max(0.7, min(2.0, box_h / 140.0))
+            thickness = 2 if font_scale < 1.2 else 3
+
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            cx = x1 + (x2 - x1) // 2 - tw // 2
+            cy = y1 + (y2 - y1) // 2 + th // 2
+            # Add subtle background shadow for readability
+            cv2.putText(img, label_text, (cx+2, cy+2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness+2)
+            cv2.putText(img, label_text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+        # Title banner
+        title = f"Shelf Map — Frame {frame_idx} — Analysis {analysis_id[:8]}"
+        cv2.putText(img, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        ok, buf = cv2.imencode('.png', img)
+        if not ok:
+            return None
+        return buf.tobytes()
+    except Exception as e:
+        logger.error(f"Error generating shelf map image for frame {frame_idx}: {e}")
+        return None
+
+def generate_shelf_map_images(video_path: str, shelf_boxes_per_frame: dict, analysis_id: str, top_k: int = 3):
+    """Generate shelf map images for top_k frames with the most shelves.
+
+    Returns list of tuples: [(frame_idx, png_bytes), ...]
+    """
+    try:
+        if not shelf_boxes_per_frame:
+            return []
+        # Rank frames by number of shelves detected (descending)
+        ranked = sorted(
+            ((f_idx, len(shelf_boxes_per_frame.get(f_idx, []))) for f_idx in shelf_boxes_per_frame.keys()),
+            key=lambda x: x[1], reverse=True
+        )
+        selected_frames: list[int] = []
+        if ranked:
+            # Always include the top frame first
+            top_frame = ranked[0][0]
+            selected_frames.append(top_frame)
+            # Build candidate pool from remaining frames
+            positive_candidates = [f for f, cnt in ranked[1:] if cnt > 0]
+            fallback_candidates = [f for f, _ in ranked[1:]]
+            candidates = positive_candidates if positive_candidates else fallback_candidates
+            # Randomly sample the rest (up to top_k - 1)
+            remaining = max(0, top_k - 1)
+            if candidates:
+                if len(candidates) <= remaining:
+                    picked = candidates
+                else:
+                    picked = random.sample(candidates, remaining)
+                selected_frames.extend(picked)
+        results = []
+        for f_idx in selected_frames:
+            img_bytes = _generate_shelf_map_image_for_frame(video_path, f_idx, shelf_boxes_per_frame, analysis_id)
+            if img_bytes:
+                results.append((f_idx, img_bytes))
+        return results
+    except Exception as e:
+        logger.error(f"Error generating multiple shelf map images: {e}")
+        return []
+
 @app.get("/stream")
 def stream_blob(blob: str, range: str | None = Header(default=None)):
     """Proxy stream a blob with HTTP Range support for video playback."""
@@ -1406,45 +1525,70 @@ def ai_insights(req: InsightRequest):
             else:
                 logger.warning("Failed to process heatmap image, continuing without vision")
 
-        def _call_llm(msg_content):
-            return client.chat.completions.create(
+        def _call_llm(msg_content, use_json_mode: bool):
+            kwargs = dict(
                 model=AZURE_OPENAI_DEPLOYMENT,
                 messages=[
                     {"role": "system", "content": [
-                        {"type": "text", "text": 
+                        {"type": "text", "text":
                          "Anda analis retail. Keluaran: JSON valid."
                          " Struktur: items[analysis,pattern,opportunity,warning] + summary."
                          " Tiap item berisi 4-6 bullet yang spesifik & actionable (boleh ada priority)"
                          " Summary 5-6 kalimat: rangkum temuan kunci + rencana aksi prioritas "
-                         " Bahasa indonesia profesional namun tidak kaku, jelas , tanpa markdown"
-                        }
+                         " Bahasa indonesia profesional namun tidak kaku, jelas , tanpa markdown"}
                     ]},
                     {"role": "user", "content": msg_content},
                 ],
                 temperature=0.3,
                 max_tokens=1500,
-                response_format={"type": "json_object"},
             )
+            if use_json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            return client.chat.completions.create(**kwargs)
 
-        try:
-            resp = _call_llm(content)
-        except Exception as first_err:
-            # Retry tanpa gambar jika model tidak mendukung input_image
+        def _extract_json(text: str):
+            # Strip code fences
+            t = text.strip()
+            if t.startswith("```"):
+                t = t.strip('`')
+            # Try direct parse
             try:
-                content_no_img = [c for c in content if c.get("type") != "input_image"]
-                resp = _call_llm(content_no_img)
-            except Exception as second_err:
-                logger.error(f"AI insight failed (first): {first_err}")
-                logger.error(f"AI insight failed (retry): {second_err}")
-                return JSONResponse(status_code=500, content={
-                    "error": "LLM call failed",
-                    "details": str(second_err),
-                })
+                return json.loads(t)
+            except Exception:
+                pass
+            # Fallback: find first JSON object by braces
+            try:
+                start = t.find('{')
+                end = t.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    cand = t[start:end+1]
+                    return json.loads(cand)
+            except Exception:
+                pass
+            return None
+
+        # Layered retries for model capability differences
+        resp = None
+        errors: list[str] = []
+        for with_image in (True, False):
+            msg = content if with_image else [c for c in content if c.get("type") != "image_url"]
+            for use_json_mode in (True, False):
+                try:
+                    resp = _call_llm(msg, use_json_mode)
+                    break
+                except Exception as e:
+                    errors.append(str(e))
+                    resp = None
+            if resp is not None:
+                break
+        if resp is None:
+            logger.error("AI insight failed after retries: %s", errors[-1] if errors else "unknown")
+            return JSONResponse(status_code=500, content={"error": "LLM call failed", "details": errors[-1] if errors else "unknown"})
 
         text = resp.choices[0].message.content or "{}"
-        try:
-            parsed = json.loads(text)
-        except Exception:
+        parsed = _extract_json(text)
+        if parsed is None:
+            # Return as plain text if still not JSON
             return JSONResponse(content={"items": [], "summary": text})
 
         # Normalize to consistent shape: items[] + summary
@@ -1554,8 +1698,8 @@ def ai_qa(req: QARequest):
     client = _get_azure_client()
     try:
         content = [
-            {"type": "text", "text": "Jawab ringkas, langsung ke poin, dalam Bahasa Indonesia. Gunakan data yang diberikan. Jika tidak ada cukup data, sebutkan keterbatasannya. Hindari markdown berlebihan."},
-            {"type": "text", "text": f"Pertanyaan pengguna: {req.prompt}"},
+            {"type": "text", "text": "Jawab ringkas, langsung ke poin, dalam Bahasa Indonesia dan ramah. Gunakan data yang diberikan. Anda di sini sebagai asisten analis retail yang faktual dan ringkas untuk memanfaatkan data yang ada untuk membantu pemilik retail meningkatkan performa tokonya. Jika tidak ada cukup data, sebutkan keterbatasannya dan jangan berbohong. Hindari markdown berlebihan."},
+            {"type": "text", "text": f"Pertanyaan pemilik retail: {req.prompt}"},
         ]
         if req.data:
             try:
@@ -1611,8 +1755,8 @@ def ai_qa_stream(req: QARequest):
     client = _get_azure_client()
     def gen():
         content = [
-            {"type": "text", "text": "Jawab ringkas, langsung ke poin, gunakan data yang diberikan."},
-            {"type": "text", "text": f"Pertanyaan pengguna: {req.prompt}"},
+            {"type": "text", "text": "Jawab ringkas, langsung ke poin, dalam Bahasa Indonesia dan ramah. Gunakan data yang diberikan. Anda di sini sebagai asisten analis retail yang faktual dan ringkas untuk memanfaatkan data yang ada untuk membantu pemilik retail meningkatkan performa tokonya. Jika tidak ada cukup data, sebutkan keterbatasannya dan jangan berbohong. Hindari markdown berlebihan."},
+            {"type": "text", "text": f"Pertanyaan pemilik retail: {req.prompt}"},
         ]
         if req.data:
             try:
