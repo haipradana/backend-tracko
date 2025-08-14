@@ -1171,19 +1171,43 @@ def generate_annotated_video_like_gradio(video_path: str, tracks: dict, action_p
             try:
                 ffmpeg_version = subprocess.run(['ffmpeg', '-version'], capture_output=True)
                 if ffmpeg_version.returncode == 0:
+                    # Prefer NVIDIA NVENC if available (faster on GPU machines), fallback to libx264
+                    supports_nvenc = False
+                    try:
+                        enc_list = subprocess.run(
+                            ['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True
+                        )
+                        supports_nvenc = enc_list.returncode == 0 and 'h264_nvenc' in (enc_list.stdout or '')
+                    except Exception:
+                        supports_nvenc = False
+
+                    use_nvenc = supports_nvenc and torch.cuda.is_available()
+                    encoder = 'h264_nvenc' if use_nvenc else 'libx264'
+
                     h264_path = f"temp_annotated_{analysis_id}_h264.mp4"
-                    # Fast H.264 encode suitable for web streaming
-                    cmd = [
-                        'ffmpeg', '-y', '-loglevel', 'error',
-                        '-i', output_path,
-                        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-                        '-movflags', '+faststart',
-                        h264_path
-                    ]
+                    # Fast encode suitable for web streaming
+                    if use_nvenc:
+                        cmd = [
+                            'ffmpeg', '-y', '-loglevel', 'error',
+                            '-i', output_path,
+                            '-c:v', 'h264_nvenc', '-preset', 'p5', '-pix_fmt', 'yuv420p',
+                            '-movflags', '+faststart',
+                            h264_path
+                        ]
+                    else:
+                        cmd = [
+                            'ffmpeg', '-y', '-loglevel', 'error',
+                            '-i', output_path,
+                            '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+                            '-movflags', '+faststart',
+                            h264_path
+                        ]
                     subprocess.check_call(cmd)
                     os.unlink(output_path)
                     output_path = h264_path
-                    logger.info("Re-encoded annotated video to H.264 with ffmpeg")
+                    logger.info(
+                        "Re-encoded annotated video using %s for web playback", encoder
+                    )
             except Exception as _:
                 logger.warning("ffmpeg not available or re-encode failed; using original mp4v file")
 
